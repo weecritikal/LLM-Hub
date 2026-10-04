@@ -7,19 +7,45 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
-      - name: Fetch media-generation-kit if missing
+      - name: Fetch local packages the repo points to
         run: |
+          set -eo pipefail
+          echo "Folders the repo expects to be separate git repos:"
+          git ls-files -s | awk '$1=="160000"{print $2" "$4}' | tee /tmp/gitlinks.txt
+
+          while read -r SHA DIR; do
+            NAME=$(basename "$DIR")
+            case "$NAME" in
+              draw-things-community) URL=https://github.com/drawthingsai/draw-things-community.git ;;
+              media-generation-kit)  URL=https://github.com/drawthingsai/media-generation-kit.git ;;
+              *) echo "::warning::No known source for $DIR, skipping"; continue ;;
+            esac
+
+            echo "Fetching $NAME at $SHA"
+            rm -rf "$DIR"
+            mkdir -p "$DIR"
+            git -C "$DIR" init -q
+            git -C "$DIR" remote add origin "$URL"
+            if git -C "$DIR" fetch --depth 1 origin "$SHA"; then
+              git -C "$DIR" checkout -q FETCH_HEAD
+            else
+              echo "::warning::Pinned commit not available for $NAME, using latest"
+              git -C "$DIR" fetch --depth 1 origin HEAD
+              git -C "$DIR" checkout -q FETCH_HEAD
+            fi
+          done < /tmp/gitlinks.txt
+
           PKG=ios/LLMHub/LocalPackages/media-generation-kit
           if [ ! -f "$PKG/Package.swift" ]; then
-            echo "Package missing from repo, downloading public copy"
+            echo "media-generation-kit still missing, downloading latest public copy"
             rm -rf "$PKG"
             mkdir -p ios/LLMHub/LocalPackages
             git clone --depth 1 https://github.com/drawthingsai/media-generation-kit.git "$PKG"
           fi
-          ls -la "$PKG"
+
+          echo "LocalPackages contents:"
+          ls -la ios/LLMHub/LocalPackages
           test -f "$PKG/Package.swift"
 
       - name: Select latest stable Xcode
