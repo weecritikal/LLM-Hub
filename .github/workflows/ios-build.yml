@@ -1,9 +1,8 @@
 name: Build iOS IPA
-on: [workflow_dispatch] # Allows manually triggering the build
-
+on: [workflow_dispatch]
 jobs:
   build:
-    runs-on: macos-14 # Uses Apple Silicon M2 cloud runners
+    runs-on: macos-14
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -25,15 +24,15 @@ jobs:
       - name: Build and Package Archive
         run: |
           mkdir -p build/Payload
-          xcodebuild archive \
-            -workspace ios/*.xcworkspace 2>/dev/null || xcodebuild archive -project ios/*.xcodeproj \
-            -scheme LLMHub \
-            -archivePath build/LLMHub.xcarchive \
-            -destination "generic/platform=iOS" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO
-
-          # Extract application binary into standard IPA structure
+          XCODE_PROJECT=$(find ios -name "*.xcodeproj" -maxdepth 2 | head -n 1)
+          XCODE_WORKSPACE=$(find ios -name "*.xcworkspace" -maxdepth 2 | head -n 1)
+          if [ -n "$XCODE_WORKSPACE" ]; then
+            echo "Building workspace: $XCODE_WORKSPACE"
+            xcodebuild archive -workspace "$XCODE_WORKSPACE" -scheme LLMHub -archivePath build/LLMHub.xcarchive -destination "generic/platform=iOS" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+          else
+            echo "Building project: $XCODE_PROJECT"
+            xcodebuild archive -project "$XCODE_PROJECT" -scheme LLMHub -archivePath build/LLMHub.xcarchive -destination "generic/platform=iOS" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+          fi
           cp -r build/LLMHub.xcarchive/Products/Applications/*.app build/Payload/
           cd build && zip -r LLMHub.ipa Payload/
 
