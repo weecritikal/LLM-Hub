@@ -1,0 +1,44 @@
+name: Build iOS IPA
+on: [workflow_dispatch] # Allows manually triggering the build
+
+jobs:
+  build:
+    runs-on: macos-14 # Uses Apple Silicon M2 cloud runners
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Xcode version
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: 'latest-stable'
+
+      - name: Install Dependencies
+        run: |
+          if [ -f "yarn.lock" ]; then yarn install; elif [ -f "package.json" ]; then npm install; fi
+
+      - name: Install CocoaPods
+        run: |
+          cd ios && pod install || echo "No Podfile found or step skipped"
+          cd ..
+
+      - name: Build and Package Archive
+        run: |
+          mkdir -p build/Payload
+          xcodebuild archive \
+            -workspace ios/*.xcworkspace 2>/dev/null || xcodebuild archive -project ios/*.xcodeproj \
+            -scheme LLMHub \
+            -archivePath build/LLMHub.xcarchive \
+            -destination "generic/platform=iOS" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+          # Extract application binary into standard IPA structure
+          cp -r build/LLMHub.xcarchive/Products/Applications/*.app build/Payload/
+          cd build && zip -r LLMHub.ipa Payload/
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LLMHub-unsigned-ipa
+          path: build/LLMHub.ipa
