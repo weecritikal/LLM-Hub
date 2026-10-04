@@ -164,6 +164,7 @@ jobs:
           security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" > "$RUNNER_TEMP/profile.plist"
           security find-identity -v -p codesigning "$KEYCHAIN" \
             | awk '/^ *[0-9]+\)/ {print $2}' > "$RUNNER_TEMP/identities.txt"
+          security find-certificate -a -p "$KEYCHAIN" > "$RUNNER_TEMP/keychain_certs.pem" || true
           echo "Signing identities imported: $(wc -l < "$RUNNER_TEMP/identities.txt" | tr -d ' ')"
           test -s "$RUNNER_TEMP/identities.txt"
 
@@ -191,6 +192,32 @@ jobs:
           identities = [l.strip().upper() for l in open(f"{tmp}/identities.txt") if l.strip()]
           print("Certificates in profile:", sorted(profile_certs))
           print("Certificates imported:  ", identities)
+
+          # Human-readable view of both sides, so a mismatch is easy to diagnose
+          import re, ssl, subprocess
+
+          def describe(der):
+              try:
+                  r = subprocess.run(
+                      ["openssl", "x509", "-inform", "DER", "-noout", "-subject", "-enddate"],
+                      input=der, capture_output=True, timeout=20)
+                  return " ; ".join(l.strip() for l in r.stdout.decode(errors="replace").splitlines() if l.strip())
+              except Exception as e:
+                  return f"(could not read certificate: {e})"
+
+          print("---- certificates the PROFILE allows ----")
+          for c in prof.get("DeveloperCertificates", []):
+              print(hashlib.sha1(c).hexdigest().upper(), describe(c))
+          print("---- certificate(s) imported from your .p12 ----")
+          pem_path = f"{tmp}/keychain_certs.pem"
+          if os.path.exists(pem_path):
+              pem_text = open(pem_path).read()
+              for block in re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", pem_text, re.S):
+                  der = ssl.PEM_cert_to_DER_cert(block)
+                  h = hashlib.sha1(der).hexdigest().upper()
+                  if h in identities:
+                      print(h, describe(der))
+          print("-----------------------------------------")
 
           match = [i for i in identities if i in profile_certs]
           if not match:
