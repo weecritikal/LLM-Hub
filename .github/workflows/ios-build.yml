@@ -38,15 +38,70 @@ jobs:
 
           PKG=ios/LLMHub/LocalPackages/media-generation-kit
           if [ ! -f "$PKG/Package.swift" ]; then
-            echo "media-generation-kit still missing, downloading latest public copy"
+            echo "media-generation-kit missing, downloading latest public copy"
             rm -rf "$PKG"
             mkdir -p ios/LLMHub/LocalPackages
             git clone --depth 1 https://github.com/drawthingsai/media-generation-kit.git "$PKG"
           fi
 
+          DTC=ios/LLMHub/LocalPackages/draw-things-community
+          if [ ! -f "$DTC/Package.swift" ]; then
+            echo "draw-things-community missing, downloading latest public copy"
+            rm -rf "$DTC"
+            git clone --depth 1 https://github.com/drawthingsai/draw-things-community.git "$DTC"
+          fi
+
           echo "LocalPackages contents:"
           ls -la ios/LLMHub/LocalPackages
           test -f "$PKG/Package.swift"
+          test -f "$DTC/Package.swift"
+
+      - name: Patch packages (fix duplicate ZIPFoundation)
+        run: |
+          set -eo pipefail
+          python3 - <<'PY'
+          import re, pathlib
+
+          root = pathlib.Path("ios/LLMHub/LocalPackages")
+          dtc = root / "draw-things-community"
+          mgk = root / "media-generation-kit"
+
+          # 1. Rename Draw Things' built-in ZIPFoundation target
+          pkg = dtc / "Package.swift"
+          s = pkg.read_text()
+          n = s.count('"ZIPFoundation"')
+          pkg.write_text(s.replace('"ZIPFoundation"', '"DTZIPFoundation"'))
+          print("Package.swift: renamed", n, "ZIPFoundation references")
+
+          changed = 0
+          for sub in ("Libraries", "Apps"):
+              base = dtc / sub
+              if not base.exists():
+                  continue
+              for f in base.rglob("*.swift"):
+                  try:
+                      t = f.read_text()
+                  except Exception:
+                      continue
+                  t2 = re.sub(r"\bimport ZIPFoundation\b", "import DTZIPFoundation", t)
+                  if t2 != t:
+                      f.write_text(t2)
+                      changed += 1
+          print("Updated imports in", changed, "source files")
+
+          # 2. Point media-generation-kit at the local draw-things-community
+          mp = mgk / "Package.swift"
+          m = mp.read_text()
+          m2, k = re.subn(
+              r'\.package\(\s*url:\s*"https://github\.com/drawthingsai/draw-things-community(?:\.git)?"[^)]*\)',
+              '.package(path: "../draw-things-community")',
+              m, flags=re.S)
+          mp.write_text(m2)
+          print("media-generation-kit: replaced", k, "draw-things-community dependency")
+          PY
+
+          echo "---- media-generation-kit Package.swift ----"
+          cat ios/LLMHub/LocalPackages/media-generation-kit/Package.swift
 
       - name: Select latest stable Xcode
         uses: maxim-lobanov/setup-xcode@v1
