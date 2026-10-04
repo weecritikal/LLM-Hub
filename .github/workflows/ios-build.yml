@@ -103,6 +103,25 @@ jobs:
           echo "---- media-generation-kit Package.swift ----"
           cat ios/LLMHub/LocalPackages/media-generation-kit/Package.swift
 
+      - name: Create Secrets xcconfig files
+        run: |
+          set -eo pipefail
+          cd ios/LLMHub
+          # These files are gitignored, so they are never in the checkout.
+          # The repo ships .template copies; build from those.
+          for cfg in debug release; do
+            if [ -f "Secrets.$cfg.xcconfig.template" ]; then
+              cp "Secrets.$cfg.xcconfig.template" "Secrets.$cfg.xcconfig"
+            else
+              printf 'BYPASS_PREMIUM_UNLOCK = NO\nHF_TOKEN =\n' > "Secrets.$cfg.xcconfig"
+            fi
+          done
+          # Release builds must never bypass the premium unlock
+          grep -q '^BYPASS_PREMIUM_UNLOCK *= *NO' Secrets.release.xcconfig
+          ls -la Secrets.*.xcconfig
+          echo "---- Secrets.release.xcconfig ----"
+          cat Secrets.release.xcconfig
+
       - name: Select latest stable Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
@@ -141,66 +160,165 @@ jobs:
           cp "$RUNNER_TEMP/profile.mobileprovision" \
             "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
 
+          # Decoded copies used by the checks and the signing step
+          security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          security find-identity -v -p codesigning "$KEYCHAIN" \
+            | awk '/^ *[0-9]+\)/ {print $2}' > "$RUNNER_TEMP/identities.txt"
+          echo "Signing identities imported: $(wc -l < "$RUNNER_TEMP/identities.txt" | tr -d ' ')"
+          test -s "$RUNNER_TEMP/identities.txt"
+
+      - name: Check certificate matches profile
+        run: |
+          set -eo pipefail
+          python3 - <<'PY'
+          import datetime, hashlib, os, plistlib, sys
+
+          tmp = os.environ["RUNNER_TEMP"]
+          prof = plistlib.load(open(f"{tmp}/profile.plist", "rb"))
+
+          print("Profile name:   ", prof.get("Name"))
+          print("Team:           ", prof.get("TeamIdentifier"))
+          print("App ID:         ", prof.get("Entitlements", {}).get("application-identifier"))
+          print("Devices in profile:", len(prof.get("ProvisionedDevices", [])))
+
+          now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+          exp = prof.get("ExpirationDate")
+          if exp and exp < now:
+              print(f"::error::The provisioning profile expired on {exp} UTC. Regenerate it and update the PROVISION_PROFILE_BASE64 secret.")
+              sys.exit(1)
+
+          profile_certs = {hashlib.sha1(c).hexdigest().upper() for c in prof.get("DeveloperCertificates", [])}
+          identities = [l.strip().upper() for l in open(f"{tmp}/identities.txt") if l.strip()]
+          print("Certificates in profile:", sorted(profile_certs))
+          print("Certificates imported:  ", identities)
+
+          match = [i for i in identities if i in profile_certs]
+          if not match:
+              print("::error::The provisioning profile does not include the certificate in your .p12. "
+                    "In the Apple Developer portal, edit the profile, tick this exact Apple Development "
+                    "certificate and your device, download the profile again, base64 it and update PROVISION_PROFILE_BASE64.")
+              sys.exit(1)
+
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"SIGN_IDENTITY={match[0]}\n")
+          print("Using signing identity:", match[0])
+
+          # Entitlements the app asks for vs. what the profile allows
+          wanted = plistlib.load(open("ios/LLMHub/LLMHub.entitlements", "rb"))
+          allowed = prof.get("Entitlements", {})
+          for key in wanted:
+              if key not in allowed:
+                  print(f"::warning::Profile does not allow '{key}'. It will be left out of the signature so the app still installs, "
+                        "but the app will not get that capability. Enable it on the App ID, regenerate the profile and update the secret.")
+          PY
+
       - name: Resolve packages
         run: |
           xcodebuild -resolvePackageDependencies \
             -project ios/LLMHub/LLMHub.xcodeproj \
             -scheme LLMHub
 
-      - name: Archive
-        env:
-          TEAM_ID: ${{ secrets.TEAM_ID }}
-          PROFILE_NAME: ${{ secrets.PROFILE_NAME }}
+      - name: Archive (unsigned)
         run: |
           set -eo pipefail
+          mkdir -p build
+          # Signing happens in the next step. Passing a provisioning profile on the
+          # command line breaks every Swift package target, so the archive is unsigned.
           xcodebuild archive \
             -project ios/LLMHub/LLMHub.xcodeproj \
             -scheme LLMHub \
+            -configuration Release \
             -archivePath build/LLMHub.xcarchive \
             -destination "generic/platform=iOS" \
             -skipPackagePluginValidation \
             -skipMacroValidation \
-            CODE_SIGN_STYLE=Manual \
-            DEVELOPMENT_TEAM="$TEAM_ID" \
-            CODE_SIGN_IDENTITY="Apple Development" \
-            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME"
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            2>&1 | tee build/archive.log
 
-      - name: Show embedded entitlements
+      - name: Show only the errors from a failed archive
+        if: failure()
         run: |
-          APP=$(ls -d build/LLMHub.xcarchive/Products/Applications/*.app)
-          codesign -d --entitlements :- "$APP" || true
+          echo "==== error lines from build/archive.log ===="
+          grep -E "error:|ARCHIVE FAILED|fatal error" build/archive.log 2>/dev/null | sort -u | head -40 || true
 
-      - name: Export IPA
-        env:
-          TEAM_ID: ${{ secrets.TEAM_ID }}
-          PROFILE_NAME: ${{ secrets.PROFILE_NAME }}
+      - name: Sign app and package IPA
         run: |
           set -eo pipefail
-          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :ApplicationProperties:CFBundleIdentifier" \
-            build/LLMHub.xcarchive/Info.plist)
+          test -n "$SIGN_IDENTITY"
+          APP=$(ls -d build/LLMHub.xcarchive/Products/Applications/*.app | head -n 1)
+          echo "App bundle: $APP"
 
-          cat > build/ExportOptions.plist <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>method</key><string>debugging</string>
-            <key>teamID</key><string>$TEAM_ID</string>
-            <key>signingStyle</key><string>manual</string>
-            <key>signingCertificate</key><string>Apple Development</string>
-            <key>provisioningProfiles</key>
-            <dict><key>$BUNDLE_ID</key><string>$PROFILE_NAME</string></dict>
-          </dict>
-          </plist>
-          EOF
+          # Build the entitlements to sign with: the profile's entitlements
+          # (these are what Xcode would use), checked against the app's bundle ID.
+          python3 - "$APP" <<'PY'
+          import os, pathlib, plistlib, sys
 
-          xcodebuild -exportArchive \
-            -archivePath build/LLMHub.xcarchive \
-            -exportPath build/export \
-            -exportOptionsPlist build/ExportOptions.plist
+          tmp = os.environ["RUNNER_TEMP"]
+          app = pathlib.Path(sys.argv[1])
+          prof = plistlib.load(open(f"{tmp}/profile.plist", "rb"))
+          info = plistlib.load(open(app / "Info.plist", "rb"))
+          wanted = plistlib.load(open("ios/LLMHub/LLMHub.entitlements", "rb"))
+
+          bundle = info["CFBundleIdentifier"]
+          team = prof["TeamIdentifier"][0]
+          ents = dict(prof["Entitlements"])
+          appid = ents.get("application-identifier", "")
+          prefix = team + "."
+
+          if not appid.startswith(prefix):
+              print(f"::error::Unexpected application-identifier in profile: {appid}")
+              sys.exit(1)
+          pattern = appid[len(prefix):]
+          ok = (pattern == "*" or pattern == bundle or
+                (pattern.endswith("*") and bundle.startswith(pattern[:-1])))
+          if not ok:
+              print(f"::error::App bundle ID '{bundle}' does not match the profile's App ID '{appid}'. "
+                    "Use a profile created for this exact bundle ID.")
+              sys.exit(1)
+
+          # A wildcard profile still needs a concrete application-identifier
+          ents["application-identifier"] = prefix + bundle
+          if "keychain-access-groups" in ents:
+              ents["keychain-access-groups"] = [
+                  (prefix + bundle) if g.endswith(".*") else g
+                  for g in ents["keychain-access-groups"]
+              ]
+
+          for key in wanted:
+              status = "included" if key in ents else "NOT in profile, left out"
+              print(f"  app entitlement {key}: {status}")
+
+          with open(f"{tmp}/entitlements.plist", "wb") as f:
+              plistlib.dump(ents, f, fmt=plistlib.FMT_XML)
+          print("Bundle ID:", bundle)
+          PY
+
+          cp "$RUNNER_TEMP/profile.mobileprovision" "$APP/embedded.mobileprovision"
+
+          # Sign nested code first (deepest first), then the app itself
+          while IFS= read -r -d '' ITEM; do
+            echo "Signing $ITEM"
+            codesign --force --sign "$SIGN_IDENTITY" --timestamp=none "$ITEM"
+          done < <(find "$APP" -depth \( -name "*.framework" -o -name "*.dylib" \) -print0)
+
+          codesign --force --sign "$SIGN_IDENTITY" --timestamp=none \
+            --generate-entitlement-der \
+            --entitlements "$RUNNER_TEMP/entitlements.plist" "$APP"
+
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          echo "---- final entitlements ----"
+          codesign -d --entitlements :- "$APP" 2>/dev/null || true
+
+          rm -rf build/Payload
+          mkdir -p build/Payload
+          ditto "$APP" "build/Payload/$(basename "$APP")"
+          (cd build && zip -qry LLMHub.ipa Payload)
+          ls -lh build/LLMHub.ipa
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
           name: LLMHub-signed-ipa
-          path: build/export/*.ipa
+          path: build/LLMHub.ipa
