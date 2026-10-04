@@ -538,7 +538,7 @@
 				);
 				MARKETING_VERSION = 1.4.0;
 				OTHER_LDFLAGS = "$(inherited)";
-				PRODUCT_BUNDLE_IDENTIFIER = com.llmhub.llmhub;
+				PRODUCT_BUNDLE_IDENTIFIER = com.korbin.llmhub;
 				PRODUCT_NAME = LLMHub;
 				SDKROOT = iphoneos;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = YES;
@@ -583,7 +583,7 @@
 				);
 				MARKETING_VERSION = 1.4.0;
 				OTHER_LDFLAGS = "$(inherited)";
-				PRODUCT_BUNDLE_IDENTIFIER = com.llmhub.llmhub;
+				PRODUCT_BUNDLE_IDENTIFIER = com.korbin.llmhub;
 				PRODUCT_NAME = LLMHub;
 				SDKROOT = iphoneos;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = YES;
